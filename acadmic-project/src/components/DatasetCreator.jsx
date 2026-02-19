@@ -86,7 +86,7 @@ const DatasetCreator = () => {
                 setCurrentSample(i + 1);
 
                 // Countdown
-                for (let c = 3; c > 0; c--) {
+                for (let c = 1; c > 0; c--) {
                     setCountdown(c);
                     setStatusMessage(`Get ready... ${c}`);
                     await delay(1000);
@@ -135,7 +135,7 @@ const DatasetCreator = () => {
                 setRecordingProgress(0);
                 setCurrentSample(0);
                 setStatusMessage('');
-            }, 3000);
+            }, 1000);
 
         } catch (err) {
             console.error('Recording error:', err);

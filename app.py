@@ -12,6 +12,8 @@ import threading
 import time
 from datetime import datetime
 
+import torch.nn.functional as F
+
 app = Flask(__name__)
 CORS(app)
 
@@ -37,10 +39,79 @@ auto_trained = False
 # ==============================
 # MODEL DEFINITION
 # ==============================
-class TGLNet(nn.Module):
+# class TGLNet(nn.Module):
+#     def __init__(self, num_classes):
+#         super().__init__()
+#         self.temporal_fc = nn.Linear(126, 128)
+#         self.transformer = nn.TransformerEncoder(
+#             nn.TransformerEncoderLayer(
+#                 d_model=128,
+#                 nhead=8,
+#                 batch_first=True
+#             ),
+#             num_layers=2
+#         )
+#         self.classifier = nn.Linear(128, num_classes)
+
+#     def forward(self, x):
+#         x = self.temporal_fc(x)
+#         x = self.transformer(x)
+#         x = x.mean(dim=1)
+#         return self.classifier(x)
+
+# ==============================
+# GRAPH CONVOLUTION LAYER
+# ==============================
+class GraphConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.fc = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x):
+        # x: (B, T, J, C)
+        B, T, J, C = x.shape
+        x = self.fc(x)
+        return x
+
+
+# ==============================
+# ST-GCN BLOCK
+# ==============================
+class STGCNBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.gcn = GraphConv(in_channels, out_channels)
+        self.temporal_conv = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=(3, 1),
+            padding=(1, 0)
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        # x: (B, T, J, C)
+        x = self.gcn(x)
+        x = x.permute(0, 3, 1, 2)  # (B, C, T, J)
+        x = self.temporal_conv(x)
+        x = self.bn(x)
+        x = F.relu(x)
+        x = x.permute(0, 2, 3, 1)  # back to (B, T, J, C)
+        return x
+
+
+# ==============================
+# GRAPH TRANSFORMER MODEL
+# ==============================
+class GraphTransformerNet(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        self.temporal_fc = nn.Linear(126, 128)
+
+        self.stgcn1 = STGCNBlock(3, 64)
+        self.stgcn2 = STGCNBlock(64, 128)
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=128,
@@ -49,12 +120,22 @@ class TGLNet(nn.Module):
             ),
             num_layers=2
         )
+
         self.classifier = nn.Linear(128, num_classes)
 
     def forward(self, x):
-        x = self.temporal_fc(x)
+        # x: (B, T, J, C)
+
+        x = self.stgcn1(x)
+        x = self.stgcn2(x)
+
+        # Global spatial pooling
+        x = x.mean(dim=2)  # (B, T, C)
+
         x = self.transformer(x)
-        x = x.mean(dim=1)
+
+        x = x.mean(dim=1)  # temporal pooling
+
         return self.classifier(x)
 
 # ==============================
@@ -167,7 +248,8 @@ def load_model():
             return False
         
         # Load model
-        model = TGLNet(len(labels)).to(DEVICE)
+        # model = TGLNet(len(labels)).to(DEVICE)
+        model = GraphTransformerNet(len(labels)).to(DEVICE)
         model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
         model.eval()
         
@@ -220,7 +302,10 @@ def auto_train_model():
                 except Exception as e:
                     training_log.append(f"⚠️  Skipped corrupted file: {file}")
         
+        # X = np.array(X)
         X = np.array(X)
+        X = X.reshape(-1, FRAMES, 42, 3)
+
         y = np.array(y)
         
         training_log.append(f"✅ Loaded {len(X)} total samples")
@@ -259,7 +344,8 @@ def auto_train_model():
         )
         
         # Initialize model
-        model = TGLNet(len(labels)).to(DEVICE)
+        # model = TGLNet(len(labels)).to(DEVICE)
+        model = GraphTransformerNet(len(labels)).to(DEVICE)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         
@@ -431,65 +517,97 @@ def video_feed():
                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def generate_frames():
-    """Generate video frames with prediction overlay"""
+    """Generate video frames with prediction overlay (stable version)"""
     global prediction_sequence, current_prediction
-    
+
     cam = get_camera()
     if cam is None:
         return
-    
-    while is_camera_on:
-        ret, frame = cam.read()
-        if not ret:
-            break
-        
-        frame = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(rgb)
-        
-        # Draw hand landmarks
-        if result.multi_hand_landmarks:
-            for hand_lms in result.multi_hand_landmarks:
-                mp_draw.draw_landmarks(
-                    frame,
-                    hand_lms,
-                    mp_hands.HAND_CONNECTIONS
-                )
-            
-            # Collect landmarks for prediction
-            if model is not None:
-                landmarks = []
+
+    mp_hands_local = mp.solutions.hands
+
+    # Initialize MediaPipe INSIDE generator (fixes timestamp issue)
+    with mp_hands_local.Hands(
+        max_num_hands=2,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7
+    ) as hands:
+
+        while is_camera_on:
+            ret, frame = cam.read()
+            if not ret:
+                break
+
+            frame = cv2.flip(frame, 1)
+
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                result = hands.process(rgb)
+            except Exception as e:
+                print("MediaPipe error:", e)
+                continue
+
+            # Draw hand landmarks
+            if result.multi_hand_landmarks:
                 for hand_lms in result.multi_hand_landmarks:
-                    for lm in hand_lms.landmark:
-                        landmarks.extend([lm.x, lm.y, lm.z])
-                
-                while len(landmarks) < 126:
-                    landmarks.extend([0.0, 0.0, 0.0])
-                
-                prediction_sequence.append(landmarks)
-                
-                if len(prediction_sequence) == FRAMES:
-                    input_tensor = torch.tensor([prediction_sequence], dtype=torch.float32).to(DEVICE)
-                    with torch.no_grad():
-                        output = model(input_tensor)
-                        pred_index = torch.argmax(output, dim=1).item()
-                        current_prediction = labels[pred_index]
-                    prediction_sequence = []
-        
-        # Add prediction overlay
-        if current_prediction and model is not None:
-            cv2.rectangle(frame, (10, 10), (450, 80), (0, 0, 0), -1)
-            cv2.putText(frame, f"Prediction: {current_prediction}",
-                       (20, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX,
-                       1.2, (0, 255, 0), 3)
-        
-        # Encode frame
-        ret, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
-        
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                    mp_draw.draw_landmarks(
+                        frame,
+                        hand_lms,
+                        mp_hands.HAND_CONNECTIONS
+                    )
+
+                # Collect landmarks for prediction
+                if model is not None:
+                    landmarks = []
+
+                    for hand_lms in result.multi_hand_landmarks:
+                        for lm in hand_lms.landmark:
+                            landmarks.extend([lm.x, lm.y, lm.z])
+
+                    # Pad to 2 hands (42 landmarks × 3 values = 126)
+                    while len(landmarks) < 126:
+                        landmarks.extend([0.0, 0.0, 0.0])
+
+                    prediction_sequence.append(landmarks)
+
+                    if len(prediction_sequence) == FRAMES:
+                        try:
+                            input_array = np.array(prediction_sequence).reshape(1, FRAMES, 42, 3)
+                            input_tensor = torch.tensor(input_array, dtype=torch.float32).to(DEVICE)
+
+                            with torch.no_grad():
+                                output = model(input_tensor)
+                                pred_index = torch.argmax(output, dim=1).item()
+                                current_prediction = labels[pred_index]
+
+                        except Exception as e:
+                            print("Model error:", e)
+
+                        prediction_sequence = []
+
+            # Add prediction overlay
+            if current_prediction and model is not None:
+                cv2.rectangle(frame, (10, 10), (500, 90), (0, 0, 0), -1)
+                cv2.putText(
+                    frame,
+                    f"Prediction: {current_prediction}",
+                    (20, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.2,
+                    (0, 255, 0),
+                    3
+                )
+
+            # Encode frame safely
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+
+            frame_bytes = buffer.tobytes()
+
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' +
+                   frame_bytes + b'\r\n')
 
 @app.route('/api/prediction/current', methods=['GET'])
 def get_current_prediction():
