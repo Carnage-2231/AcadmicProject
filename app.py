@@ -3,6 +3,7 @@ from flask_cors import CORS
 import cv2
 import mediapipe as mp
 import numpy as np
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -13,6 +14,17 @@ import time
 from datetime import datetime
 
 import torch.nn.functional as F
+
+import torch.optim as optim
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
+# from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader, Subset
+from torch.utils.tensorboard import SummaryWriter
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.model_selection import GroupKFold
+# from sklearn.metrics import f1_score, confusion_matrix
+
 
 app = Flask(__name__)
 CORS(app)
@@ -60,18 +72,48 @@ auto_trained = False
 #         return self.classifier(x)
 
 # ==============================
+# REAL HAND ADJACENCY (42 nodes for 2 hands)
+# ==============================
+def get_adjacency():
+    A = np.zeros((42, 42))
+
+    # 21 landmarks per hand
+    edges = [
+        (0,1),(1,2),(2,3),(3,4),
+        (0,5),(5,6),(6,7),(7,8),
+        (0,9),(9,10),(10,11),(11,12),
+        (0,13),(13,14),(14,15),(15,16),
+        (0,17),(17,18),(18,19),(19,20)
+    ]
+
+    # First hand
+    for i,j in edges:
+        A[i][j] = 1
+        A[j][i] = 1
+
+    # Second hand (shift by 21)
+    for i,j in edges:
+        A[i+21][j+21] = 1
+        A[j+21][i+21] = 1
+
+    return torch.tensor(A, dtype=torch.float32)
+
+# ==============================
 # GRAPH CONVOLUTION LAYER
 # ==============================
 class GraphConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.fc = nn.Linear(in_channels, out_channels)
+        self.A = get_adjacency().to(DEVICE)
 
     def forward(self, x):
         # x: (B, T, J, C)
         B, T, J, C = x.shape
+        x = torch.einsum('btjc,jk->btkc', x, self.A)
         x = self.fc(x)
         return x
+
 
 
 # ==============================
@@ -266,141 +308,194 @@ def load_model():
         model = None
         return False
 
+
+
+
+
 def auto_train_model():
-    """Automatically train the model on available datasets"""
+    """
+    Advanced Training Pipeline:
+    - Group K-Fold Cross Validation (Video Safe)
+    - F1 Score Reporting
+    - Confusion Matrix Saving
+    - TensorBoard Logging
+    - Best Model Saving
+    """
+
     global model, labels, training_log
-    
     training_log = []
-    
+
     try:
-        # Get labels
-        labels = sorted([d for d in os.listdir(DATASET_DIR) 
-                        if os.path.isdir(os.path.join(DATASET_DIR, d))])
-        
+        # -----------------------------
+        # Load Dataset
+        # -----------------------------
+        labels = sorted([
+            d for d in os.listdir(DATASET_DIR)
+            if os.path.isdir(os.path.join(DATASET_DIR, d))
+        ])
+
         if len(labels) < 2:
-            training_log.append("❌ Need at least 2 gesture classes for training")
+            training_log.append("❌ Need at least 2 gesture classes.")
             return False
-        
+
         label_map = {label: i for i, label in enumerate(labels)}
-        
-        # Load all samples
-        X, y = [], []
-        training_log.append(f"📊 Loading datasets for {len(labels)} gestures...")
-        
+
+        X, y, groups = [], [], []
+
+        training_log.append("📂 Loading dataset...")
+
+        video_counter = 0
+
         for label in labels:
             folder = os.path.join(DATASET_DIR, label)
-            files = [f for f in os.listdir(folder) if f.endswith('.npy')]
-            
-            if len(files) < 5:
-                training_log.append(f"⚠️  {label}: Only {len(files)} samples (recommend 20+)")
-            
-            for file in files:
-                try:
-                    data = np.load(os.path.join(folder, file))
-                    X.append(data)
-                    y.append(label_map[label])
-                except Exception as e:
-                    training_log.append(f"⚠️  Skipped corrupted file: {file}")
-        
-        # X = np.array(X)
-        X = np.array(X)
-        X = X.reshape(-1, FRAMES, 42, 3)
+            files = [f for f in os.listdir(folder) if f.endswith(".npy")]
 
+            for file in files:
+                data = np.load(os.path.join(folder, file))
+                X.append(data)
+                y.append(label_map[label])
+
+                # Each file = one video group
+                groups.append(video_counter)
+                video_counter += 1
+
+        X = np.array(X).reshape(-1, FRAMES, 42, 3)
         y = np.array(y)
-        
-        training_log.append(f"✅ Loaded {len(X)} total samples")
-        
+        groups = np.array(groups)
+
         if len(X) < 10:
-            training_log.append("❌ Need at least 10 total samples for training")
+            training_log.append("❌ Not enough samples.")
             return False
-        
-        # Train/test split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-        
-        training_log.append(f"📊 Train samples: {len(X_train)}, Test samples: {len(X_test)}")
-        
-        # Create dataset
-        class GestureDataset(Dataset):
-            def __init__(self, X, y):
-                self.X = torch.tensor(X, dtype=torch.float32)
-                self.y = torch.tensor(y, dtype=torch.long)
-            
-            def __len__(self):
-                return len(self.y)
-            
-            def __getitem__(self, idx):
-                return self.X[idx], self.y[idx]
-        
-        train_loader = DataLoader(
-            GestureDataset(X_train, y_train), 
-            batch_size=min(8, len(X_train)), 
-            shuffle=True
-        )
-        test_loader = DataLoader(
-            GestureDataset(X_test, y_test), 
-            batch_size=min(8, len(X_test))
-        )
-        
-        # Initialize model
-        # model = TGLNet(len(labels)).to(DEVICE)
-        model = GraphTransformerNet(len(labels)).to(DEVICE)
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-        
-        training_log.append(f"🎯 Starting training on {DEVICE}...")
-        
-        # Training loop
-        epochs = 20
-        for epoch in range(epochs):
-            model.train()
-            total_loss = 0
-            
-            for X_batch, y_batch in train_loader:
-                X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
-                
-                optimizer.zero_grad()
-                output = model(X_batch)
-                loss = criterion(output, y_batch)
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-            
-            avg_loss = total_loss / len(train_loader)
-            log_msg = f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}"
-            print(f"   {log_msg}")
-            training_log.append(log_msg)
-        
-        # Evaluate
-        model.eval()
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for X_batch, y_batch in test_loader:
-                X_batch, y_batch = X_batch.to(DEVICE), y_batch.to(DEVICE)
-                outputs = model(X_batch)
-                predictions = torch.argmax(outputs, dim=1)
-                correct += (predictions == y_batch).sum().item()
-                total += y_batch.size(0)
-        
-        accuracy = 100 * correct / total
-        training_log.append(f"✅ Test Accuracy: {accuracy:.2f}%")
-        print(f"   ✅ Test Accuracy: {accuracy:.2f}%")
-        
-        # Save model
-        torch.save(model.state_dict(), MODEL_PATH)
-        training_log.append(f"💾 Model saved as {MODEL_PATH}")
-        print(f"   💾 Model saved as {MODEL_PATH}")
-        
+
+        training_log.append(f"📊 Total videos: {len(X)}")
+
+        # -----------------------------
+        # Group K-Fold Setup
+        # -----------------------------
+        gkf = GroupKFold(n_splits=5)
+        fold_f1_scores = []
+        best_f1 = 0
+
+        for fold, (train_ids, val_ids) in enumerate(gkf.split(X, y, groups)):
+
+            training_log.append(f"\n🔁 Fold {fold+1}/5")
+
+            model = GraphTransformerNet(len(labels)).to(DEVICE)
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+            criterion = nn.CrossEntropyLoss()
+
+            writer = SummaryWriter(log_dir=f"runs/group_fold_{fold+1}")
+
+            X_train, X_val = X[train_ids], X[val_ids]
+            y_train, y_val = y[train_ids], y[val_ids]
+
+            train_dataset = torch.utils.data.TensorDataset(
+                torch.tensor(X_train, dtype=torch.float32),
+                torch.tensor(y_train, dtype=torch.long)
+            )
+
+            val_dataset = torch.utils.data.TensorDataset(
+                torch.tensor(X_val, dtype=torch.float32),
+                torch.tensor(y_val, dtype=torch.long)
+            )
+
+            train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=8)
+
+            # -----------------------------
+            # Training Loop
+            # -----------------------------
+            epochs = 20
+
+            for epoch in range(epochs):
+
+                model.train()
+                total_loss = 0
+
+                for xb, yb in train_loader:
+                    xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+
+                    optimizer.zero_grad()
+                    output = model(xb)
+                    loss = criterion(output, yb)
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+
+                avg_loss = total_loss / len(train_loader)
+                writer.add_scalar("Loss/train", avg_loss, epoch)
+
+                training_log.append(
+                    f"Fold {fold+1} | Epoch {epoch+1} | Loss: {avg_loss:.4f}"
+                )
+
+            # -----------------------------
+            # Validation
+            # -----------------------------
+            model.eval()
+            all_preds = []
+            all_labels = []
+
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(DEVICE)
+                    output = model(xb)
+
+                    probs = torch.softmax(output, dim=1)
+                    preds = torch.argmax(probs, dim=1)
+
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(yb.numpy())
+
+            f1 = f1_score(all_labels, all_preds, average="weighted")
+            fold_f1_scores.append(f1)
+
+            writer.add_scalar("F1/validation", f1, 0)
+            training_log.append(f"✅ Fold {fold+1} F1 Score: {f1:.4f}")
+
+            # Save best model across folds
+            if f1 > best_f1:
+                best_f1 = f1
+                torch.save(model.state_dict(), MODEL_PATH)
+                training_log.append("💾 Best model updated.")
+
+            # -----------------------------
+            # Confusion Matrix
+            # -----------------------------
+            cm = confusion_matrix(all_labels, all_preds)
+
+            plt.figure(figsize=(6,5))
+            sns.heatmap(cm,
+                        annot=True,
+                        fmt="d",
+                        cmap="Blues",
+                        xticklabels=labels,
+                        yticklabels=labels)
+
+            plt.xlabel("Predicted")
+            plt.ylabel("Actual")
+            plt.title(f"Confusion Matrix - Fold {fold+1}")
+
+            cm_path = f"confusion_matrix_group_fold_{fold+1}.png"
+            plt.savefig(cm_path)
+            plt.close()
+
+            training_log.append(f"📊 Confusion matrix saved: {cm_path}")
+            writer.close()
+
+        # -----------------------------
+        # Final Average F1
+        # -----------------------------
+        avg_f1 = np.mean(fold_f1_scores)
+
+        training_log.append(f"\n🎯 Average F1 Score (Group 5-Fold): {avg_f1:.4f}")
+        print(f"\n🎯 Average F1 Score: {avg_f1:.4f}")
+
         return True
-        
+
     except Exception as e:
-        error_msg = f"❌ Training error: {str(e)}"
-        training_log.append(error_msg)
-        print(f"   {error_msg}")
+        training_log.append(f"❌ Training Error: {str(e)}")
         return False
 
 # ==============================
@@ -577,8 +672,17 @@ def generate_frames():
 
                             with torch.no_grad():
                                 output = model(input_tensor)
-                                pred_index = torch.argmax(output, dim=1).item()
-                                current_prediction = labels[pred_index]
+                                probs = torch.softmax(output, dim=1)
+                                confidence, pred_index = torch.max(probs, 1)
+
+                                confidence_value = confidence.item()
+                                pred_index = pred_index.item()
+
+                                if confidence_value > 0.70:   # confidence threshold
+                                    current_prediction = f"{labels[pred_index]} ({confidence_value*100:.1f}%)"
+                                else:
+                                    current_prediction = "Uncertain"
+
 
                         except Exception as e:
                             print("Model error:", e)
@@ -752,6 +856,14 @@ def train_model_endpoint():
         "status": "success",
         "message": "Training started in background. Check /api/training/status for progress."
     })
+
+@app.route('/api/model/confusion', methods=['GET'])
+def get_confusion_matrix():
+    images = [f for f in os.listdir('.') if f.startswith("confusion_fold")]
+    return jsonify({
+        "confusion_matrices": images
+    })
+
 
 @app.route('/api/training/status', methods=['GET'])
 def get_training_status():
