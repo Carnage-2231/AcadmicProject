@@ -17,13 +17,11 @@ import torch.nn.functional as F
 
 import torch.optim as optim
 from sklearn.metrics import confusion_matrix, classification_report, f1_score
-# from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.model_selection import GroupKFold
-# from sklearn.metrics import f1_score, confusion_matrix
 
 
 app = Flask(__name__)
