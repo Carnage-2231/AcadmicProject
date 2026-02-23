@@ -3,7 +3,6 @@ from flask_cors import CORS
 import cv2
 import mediapipe as mp
 import numpy as np
-"hello"
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -22,7 +21,9 @@ from torch.utils.tensorboard import SummaryWriter
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.model_selection import GroupKFold
+from collections import deque
 
+prediction_buffer = deque(maxlen=5)
 
 app = Flask(__name__)
 CORS(app)
@@ -32,7 +33,10 @@ CORS(app)
 # ==============================
 DATASET_DIR = "dataset"
 MODEL_PATH = "tgl_net.pth"
-FRAMES = 30
+FRAMES = 40
+DURATION = 4 
+CONFIDENCE_THRESHOLD = 0.85
+PREDICTION_INTERVAL = 3 # seconds to wait before making a new prediction 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Global state
@@ -150,12 +154,13 @@ class GraphTransformerNet(nn.Module):
         self.stgcn1 = STGCNBlock(3, 64)
         self.stgcn2 = STGCNBlock(64, 128)
 
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(0.3)  # 🔥 Added
 
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=128,
                 nhead=8,
+                dropout=0.3,  # 🔥 Added
                 batch_first=True
             ),
             num_layers=2
@@ -164,20 +169,20 @@ class GraphTransformerNet(nn.Module):
         self.classifier = nn.Linear(128, num_classes)
 
     def forward(self, x):
-        # x: (B, T, J, C)
-
         x = self.stgcn1(x)
         x = self.stgcn2(x)
 
-        # Global spatial pooling
-        x = x.mean(dim=2)  # (B, T, C)
+        x = x.mean(dim=2)
+
+        x = self.dropout(x)  # 🔥 Added
 
         x = self.transformer(x)
 
-        x = x.mean(dim=1)  # temporal pooling
+        x = x.mean(dim=1)
+
+        x = self.dropout(x)  # 🔥 Added
 
         return self.classifier(x)
-
 # ==============================
 # CAMERA MANAGEMENT
 # ==============================
@@ -357,7 +362,11 @@ def auto_train_model():
                 groups.append(video_counter)
                 video_counter += 1
 
-        X = np.array(X).reshape(-1, FRAMES, 42, 3)
+        X = np.array(X)
+
+        if X.shape[1:] != (FRAMES, 42, 3):
+            raise ValueError(f"Dataset shape mismatch: {X.shape}")
+        
         y = np.array(y)
         groups = np.array(groups)
 
@@ -380,7 +389,22 @@ def auto_train_model():
 
             model = GraphTransformerNet(len(labels)).to(DEVICE)
             optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-            criterion = nn.CrossEntropyLoss()
+            
+             # Check class balance
+            class_counts = {label: 0 for label in labels}
+            for label in labels:
+                folder = os.path.join(DATASET_DIR, label)
+                class_counts[label] = len([f for f in os.listdir(folder) if f.endswith(".npy")])
+
+            print("Class distribution:", class_counts)
+            training_log.append(f"Class distribution: {class_counts}")
+
+            class_sample_counts = np.array([class_counts[l] for l in labels])
+            weights = 1.0 / class_sample_counts
+            weights = weights / weights.sum()
+            weights_tensor = torch.tensor(weights, dtype=torch.float32).to(DEVICE)
+
+            criterion = nn.CrossEntropyLoss(weight=weights_tensor)
 
             writer = SummaryWriter(log_dir=f"runs/group_fold_{fold+1}")
 
@@ -610,107 +634,119 @@ def video_feed():
                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def generate_frames():
-    """Generate video frames with prediction overlay (stable version)"""
-    global prediction_sequence, current_prediction
+    global prediction_sequence, prediction_buffer, current_prediction
 
-    cam = get_camera()
-    if cam is None:
+    cap = get_camera()
+    if cap is None:
         return
 
-    mp_hands_local = mp.solutions.hands
+    frame_counter = 0
 
-    # Initialize MediaPipe INSIDE generator (fixes timestamp issue)
-    with mp_hands_local.Hands(
-        max_num_hands=2,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7
-    ) as hands:
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            break
 
-        while is_camera_on:
-            ret, frame = cam.read()
-            if not ret:
-                break
+        frame_counter += 1
 
-            frame = cv2.flip(frame, 1)
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+        # Use GLOBAL hands instance
+        results = hands.process(image)
+
+        frame_landmarks = []
+
+        if results.multi_hand_landmarks:
+            for hand_lms in results.multi_hand_landmarks:
+                coords = [[lm.x, lm.y, lm.z] for lm in hand_lms.landmark]
+
+                # Wrist normalization
+                wrist = coords[0]
+                normalized = [
+                    [x - wrist[0], y - wrist[1], z - wrist[2]]
+                    for x, y, z in coords
+                ]
+
+                frame_landmarks.extend(normalized)
+
+        # Ensure exactly 42 joints (21 per hand × 2 hands)
+        while len(frame_landmarks) < 42:
+            frame_landmarks.append([0.0, 0.0, 0.0])
+
+        frame_landmarks = frame_landmarks[:42]
+
+        # Sliding window
+        prediction_sequence.append(frame_landmarks)
+
+        if len(prediction_sequence) > FRAMES:
+            prediction_sequence.pop(0)
+
+        # Run prediction
+        if (
+            len(prediction_sequence) == FRAMES and
+            frame_counter % PREDICTION_INTERVAL == 0 and
+            model is not None
+        ):
             try:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                result = hands.process(rgb)
-            except Exception as e:
-                print("MediaPipe error:", e)
-                continue
-
-            # Draw hand landmarks
-            if result.multi_hand_landmarks:
-                for hand_lms in result.multi_hand_landmarks:
-                    mp_draw.draw_landmarks(
-                        frame,
-                        hand_lms,
-                        mp_hands.HAND_CONNECTIONS
-                    )
-
-                # Collect landmarks for prediction
-                if model is not None:
-                    landmarks = []
-
-                    for hand_lms in result.multi_hand_landmarks:
-                        for lm in hand_lms.landmark:
-                            landmarks.extend([lm.x, lm.y, lm.z])
-
-                    # Pad to 2 hands (42 landmarks × 3 values = 126)
-                    while len(landmarks) < 126:
-                        landmarks.extend([0.0, 0.0, 0.0])
-
-                    prediction_sequence.append(landmarks)
-
-                    if len(prediction_sequence) == FRAMES:
-                        try:
-                            input_array = np.array(prediction_sequence).reshape(1, FRAMES, 42, 3)
-                            input_tensor = torch.tensor(input_array, dtype=torch.float32).to(DEVICE)
-
-                            with torch.no_grad():
-                                output = model(input_tensor)
-                                probs = torch.softmax(output, dim=1)
-                                confidence, pred_index = torch.max(probs, 1)
-
-                                confidence_value = confidence.item()
-                                pred_index = pred_index.item()
-
-                                if confidence_value > 0.70:   # confidence threshold
-                                    current_prediction = f"{labels[pred_index]} ({confidence_value*100:.1f}%)"
-                                else:
-                                    current_prediction = "Uncertain"
-
-
-                        except Exception as e:
-                            print("Model error:", e)
-
-                        prediction_sequence = []
-
-            # Add prediction overlay
-            if current_prediction and model is not None:
-                cv2.rectangle(frame, (10, 10), (500, 90), (0, 0, 0), -1)
-                cv2.putText(
-                    frame,
-                    f"Prediction: {current_prediction}",
-                    (20, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
-                    (0, 255, 0),
-                    3
+                input_array = np.array(prediction_sequence).reshape(
+                    1, FRAMES, 42, 3
                 )
 
-            # Encode frame safely
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
+                input_tensor = torch.tensor(
+                    input_array,
+                    dtype=torch.float32
+                ).to(DEVICE)
 
-            frame_bytes = buffer.tobytes()
+                with torch.no_grad():
+                    output = model(input_tensor)
+                    probs = torch.softmax(output, dim=1)
+                    confidence, pred_index = torch.max(probs, 1)
 
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' +
-                   frame_bytes + b'\r\n')
+                    confidence_value = confidence.item()
+                    pred_index = pred_index.item()
 
+                    if confidence_value > CONFIDENCE_THRESHOLD:
+                        prediction_buffer.append(labels[pred_index])
+
+                        if len(prediction_buffer) == prediction_buffer.maxlen:
+                            majority = max(
+                                set(prediction_buffer),
+                                key=prediction_buffer.count
+                            )
+                            current_prediction = majority
+                    else:
+                        current_prediction = "Uncertain"
+
+            except Exception as e:
+                print("Model error:", e)
+
+        # Overlay
+        if current_prediction:
+            cv2.rectangle(frame, (10, 10), (500, 90), (0, 0, 0), -1)
+            cv2.putText(
+                frame,
+                f"Prediction: {current_prediction}",
+                (20, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 255, 0),
+                3
+            )
+
+        # Encode
+        ret, buffer = cv2.imencode('.jpg', frame)
+        if not ret:
+            continue
+
+        frame_bytes = buffer.tobytes()
+
+        yield (
+            b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n' +
+            frame_bytes +
+            b'\r\n'
+        )
+    
 @app.route('/api/prediction/current', methods=['GET'])
 def get_current_prediction():
     return jsonify({
@@ -752,62 +788,114 @@ def create_dataset():
 @app.route('/api/dataset/record_sample', methods=['POST'])
 def record_sample():
     data = request.json
+
     gesture_name = data.get('gesture_name')
-    sample_index = data.get('sample_index', 0)
-    frames_required = data.get('frames_required', 30)
-    
+    sample_index = data.get('sample_index', 50)
+
+    # ✅ USER INPUT
+    duration = DURATION          # seconds
+    target_frames = FRAMES  # Always use global frame counts
+
+    # ----------------------------
+    # Validation
+    # ----------------------------
     if not gesture_name:
         return jsonify({"status": "error", "message": "Gesture name required"}), 400
-    
+
+    if duration <= 0 or target_frames <= 0:
+        return jsonify({"status": "error", "message": "Invalid duration or frame count"}), 400
+
     gesture_path = os.path.join(DATASET_DIR, gesture_name)
     os.makedirs(gesture_path, exist_ok=True)
-    
+
     cam = get_camera()
     if cam is None:
         return jsonify({"status": "error", "message": "Camera not available"}), 500
-    
-    sequence = []
-    frames_collected = 0
-    max_attempts = frames_required * 3
-    attempts = 0
-    
-    while frames_collected < frames_required and attempts < max_attempts:
+
+    # ==============================
+    # STEP 1: RECORD RAW VIDEO FRAMES
+    # ==============================
+    raw_frames = []
+    start_time = time.time()
+
+    while time.time() - start_time < duration:
         ret, frame = cam.read()
-        attempts += 1
-        
         if not ret:
             continue
-        
         frame = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(rgb)
-        
-        if result.multi_hand_landmarks:
-            landmarks = []
-            for hand_lms in result.multi_hand_landmarks:
-                for lm in hand_lms.landmark:
-                    landmarks.extend([lm.x, lm.y, lm.z])
-            
-            while len(landmarks) < 126:
-                landmarks.extend([0.0, 0.0, 0.0])
-            
-            sequence.append(landmarks)
-            frames_collected += 1
-    
-    if frames_collected == frames_required:
-        sample_path = os.path.join(gesture_path, f"sample_{sample_index}.npy")
-        np.save(sample_path, np.array(sequence))
-        
-        return jsonify({
-            "status": "success",
-            "message": f"Sample {sample_index} recorded",
-            "frames_collected": frames_collected
-        })
-    else:
+        raw_frames.append(frame)
+
+    if len(raw_frames) < target_frames:
         return jsonify({
             "status": "error",
-            "message": f"Failed to collect enough frames. Got {frames_collected}/{frames_required}"
+            "message": f"Only {len(raw_frames)} frames captured, need {target_frames}"
         }), 400
+
+    # ==============================
+    # STEP 2: EVENLY SAMPLE FRAMES
+    # ==============================
+    indices = np.linspace(
+        0,
+        len(raw_frames) - 1,
+        target_frames
+    ).astype(int)
+
+    selected_frames = [raw_frames[i] for i in indices]
+
+    # ==============================
+    # STEP 3: EXTRACT LANDMARKS
+    # ==============================
+    sequence = []
+
+    for frame in selected_frames:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = hands.process(rgb)
+
+        frame_landmarks = []
+
+        if result.multi_hand_landmarks:
+            for hand_lms in result.multi_hand_landmarks:
+                coords = [[lm.x, lm.y, lm.z] for lm in hand_lms.landmark]
+
+                wrist = coords[0]
+                normalized = [
+                    [x - wrist[0], y - wrist[1], z - wrist[2]]
+                    for x, y, z in coords
+                ]
+
+                frame_landmarks.extend(normalized)
+
+                # Normalize using wrist (landmark 0)
+                # wrist = coords[0]
+                # normalized = [[x - wrist[0], y - wrist[1], z - wrist[2]] for x, y, z in coords]
+
+                # frame_landmarks.extend(normalized)
+
+        # Pad to 2 hands (42 joints)
+        while len(frame_landmarks) < 42:
+            frame_landmarks.append([0.0, 0.0, 0.0])
+        frame_landmarks = frame_landmarks[:42]
+        sequence.append(frame_landmarks)
+
+    sequence = np.array(sequence)  # (target_frames, 42, 3)
+
+    # ==============================
+    # STEP 4: SAVE SAMPLE
+    # ==============================
+    sample_path = os.path.join(
+        gesture_path,
+        f"sample_{sample_index}.npy"
+    )
+
+    np.save(sample_path, sequence)
+
+    return jsonify({
+        "status": "success",
+        "message": f"Sample {sample_index} recorded",
+        "frames_saved": len(sequence),
+        "duration_used": duration,
+        "target_frames": target_frames
+    })
 
 @app.route('/api/dataset/delete', methods=['POST'])
 def delete_gesture():

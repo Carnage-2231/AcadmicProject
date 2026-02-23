@@ -4,21 +4,19 @@ import { Camera, CameraOff, Trash2, Play } from 'lucide-react';
 
 const DatasetCreator = () => {
     const [gestureName, setGestureName] = useState('');
-    const [numSamples, setNumSamples] = useState(20);
-    const [framesPerSample, setFramesPerSample] = useState(30);
+    const [numSamples, setNumSamples] = useState(50);
     const [existingGestures, setExistingGestures] = useState([]);
     const [isCameraOn, setIsCameraOn] = useState(false);
     const [isRecording, setIsRecording] = useState(false);
     const [currentSample, setCurrentSample] = useState(0);
     const [recordingProgress, setRecordingProgress] = useState(0);
     const [statusMessage, setStatusMessage] = useState('');
-    const [countdown, setCountdown] = useState(null);
     const [videoUrl, setVideoUrl] = useState('/api/video_feed');
 
     const isCancelled = useRef(false);
     const retryLimit = 3;
 
-    /* ---------------- LOAD & REFRESH GESTURES ---------------- */
+    /* ---------------- LOAD GESTURES ---------------- */
 
     const refreshGestures = async () => {
         try {
@@ -76,24 +74,16 @@ const DatasetCreator = () => {
 
             await axios.post('/api/dataset/create', {
                 gesture_name: gestureName.trim(),
-                num_samples: numSamples,
-                frames_per_sample: framesPerSample
+                num_samples: numSamples
             });
 
             for (let i = 0; i < numSamples; i++) {
                 if (isCancelled.current) break;
 
                 setCurrentSample(i + 1);
-
-                // Countdown
-                for (let c = 1; c > 0; c--) {
-                    setCountdown(c);
-                    setStatusMessage(`Get ready... ${c}`);
-                    await delay(1000);
-                }
-
-                setCountdown(null);
-                setStatusMessage(`Recording sample ${i + 1}/${numSamples}...`);
+                setStatusMessage(
+                    `Recording sample ${i + 1}/${numSamples} (3 seconds)...`
+                );
 
                 let retries = 0;
                 let success = false;
@@ -102,20 +92,22 @@ const DatasetCreator = () => {
                     try {
                         await axios.post('/api/dataset/record_sample', {
                             gesture_name: gestureName.trim(),
-                            sample_index: i,
-                            frames_required: framesPerSample
+                            sample_index: i
                         });
                         success = true;
                     } catch (err) {
                         retries++;
-                        console.error(`Retry ${retries} for sample ${i + 1}`, err);
+                        console.error(
+                            `Retry ${retries} for sample ${i + 1}`,
+                            err
+                        );
                         await delay(800);
                     }
                 }
 
                 if (!success) {
                     setStatusMessage(
-                        `Failed sample ${i + 1} after ${retryLimit} retries.`
+                        `❌ Failed sample ${i + 1} after ${retryLimit} retries`
                     );
                     break;
                 }
@@ -125,9 +117,10 @@ const DatasetCreator = () => {
             }
 
             setIsRecording(false);
-            setCountdown(null);
             setRecordingProgress(100);
-            setStatusMessage(`✅ Successfully recorded ${numSamples} samples!`);
+            setStatusMessage(
+                `✅ Successfully recorded ${numSamples} samples!`
+            );
 
             await refreshGestures();
 
@@ -135,7 +128,7 @@ const DatasetCreator = () => {
                 setRecordingProgress(0);
                 setCurrentSample(0);
                 setStatusMessage('');
-            }, 1000);
+            }, 2000);
 
         } catch (err) {
             console.error('Recording error:', err);
@@ -156,7 +149,9 @@ const DatasetCreator = () => {
         if (!window.confirm(`Delete "${gesture}"?`)) return;
 
         try {
-            await axios.post('/api/dataset/delete', { gesture_name: gesture });
+            await axios.post('/api/dataset/delete', {
+                gesture_name: gesture
+            });
             setStatusMessage(`Deleted "${gesture}"`);
             await refreshGestures();
             setTimeout(() => setStatusMessage(''), 3000);
@@ -176,7 +171,7 @@ const DatasetCreator = () => {
                 <div className="form-group">
                     <label>Gesture Name</label>
                     <input
-                        className='input-field' 
+                        className='input-field'
                         type="text"
                         value={gestureName}
                         onChange={(e) => setGestureName(e.target.value)}
@@ -185,7 +180,7 @@ const DatasetCreator = () => {
                 </div>
 
                 <div className="form-row">
-                    <input 
+                    <input
                         className='input-field'
                         type="number"
                         min="5"
@@ -197,49 +192,44 @@ const DatasetCreator = () => {
                         }
                         disabled={isRecording}
                     />
-
-                    <input
-                        className='input-field'
-                        type="number"
-                        min="15"
-                        max="60"
-                        placeholder='Frames per Sample'
-                        value={framesPerSample}
-                        onChange={(e) =>
-                            setFramesPerSample(parseInt(e.target.value) || 0)
-                        }
-                        disabled={isRecording}
-                    />
                 </div>
 
-                <div className="button-group ">
-                    <button 
-                    onClick={toggleCamera} 
-                    disabled={isRecording} 
-                    className='control-button'>
-                        {isCameraOn ? <CameraOff size={18} /> : <Camera size={18} />}
-                        {isCameraOn ? ' Stop Camera' : ' Start Camera'}
+                <div className="button-group">
+                    <button
+                        onClick={toggleCamera}
+                        disabled={isRecording}
+                        className='control-button'
+                    >
+                        {isCameraOn
+                            ? <CameraOff size={18} />
+                            : <Camera size={18} />}
+                        {isCameraOn
+                            ? ' Stop Camera'
+                            : ' Start Camera'}
                     </button>
 
                     {!isRecording ? (
                         <button
                             className='control-button'
                             onClick={startRecording}
-                            disabled={!isCameraOn || !gestureName.trim()}
+                            disabled={
+                                !isCameraOn ||
+                                !gestureName.trim()
+                            }
                         >
                             <Play size={18} /> Start Recording
                         </button>
                     ) : (
                         <button
-                         onClick={stopRecording}
-                          className='control-button'>
+                            onClick={stopRecording}
+                            className='control-button'
+                        >
                             Stop Recording
                         </button>
                     )}
                 </div>
 
                 {statusMessage && <p>{statusMessage}</p>}
-                {countdown && <h1>{countdown}</h1>}
 
                 {isRecording && (
                     <div>
@@ -252,11 +242,15 @@ const DatasetCreator = () => {
                                 style={{ width: `${recordingProgress}%` }}
                             />
                         </div>
-                        <p>{Math.round(recordingProgress)}% Complete</p>
+                        <p>
+                            {Math.round(recordingProgress)}% Complete
+                        </p>
                     </div>
                 )}
 
-                <h3>Existing Gestures ({existingGestures.length})</h3>
+                <h3>
+                    Existing Gestures ({existingGestures.length})
+                </h3>
 
                 <ul>
                     {existingGestures.map((gesture, index) => (
@@ -264,7 +258,9 @@ const DatasetCreator = () => {
                             📁 {gesture}
                             <button
                                 onClick={() => deleteGesture(gesture)}
-                                disabled={isRecording || isCameraOn}
+                                disabled={
+                                    isRecording || isCameraOn
+                                }
                             >
                                 <Trash2 size={14} />
                             </button>
@@ -279,11 +275,11 @@ const DatasetCreator = () => {
                     <img
                         src={videoUrl}
                         alt="Camera Preview"
-                        className="video-stream "
+                        className="video-stream"
                     />
                 ) : (
                     <div className="video-placeholder">
-                        <CameraOff  size={64} color="#666"/>
+                        <CameraOff size={64} color="#666" />
                         <p>Camera is off</p>
                     </div>
                 )}
